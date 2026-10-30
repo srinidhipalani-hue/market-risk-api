@@ -1,10 +1,16 @@
-from fastapi import FastAPI, HTTPException
-import yfinance as yf
-import pandas as pd
-import numpy as np
+import logging
+import time
 
-from risk import daily_returns, portfolio_risk
-from db import get_conn
+from fastapi import FastAPI, HTTPException
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from app.cache import clear_risk_cache, get_json, set_json
+from app.db import get_conn
+from app.risk import daily_returns, portfolio_risk
+
+log = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title = "Market Risk API")
 
@@ -42,7 +48,13 @@ def refresh_ticker(ticker: str, period: str = "1y"):
             "SELECT COUNT(*) FROM prices WHERE ticker = %s", (symbol,)
         ).fetchone()[0]
 
-    return {"ticker": symbol, "downloaded": len(rows), "new_rows": after - before}
+    cleared = clear_risk_cache()
+    return {
+        "ticker": symbol,
+        "downloaded": len(rows),
+        "new_rows": after - before,
+        "cache_entries_cleared": cleared,
+    }
 
 
 @app.get("/prices/{ticker}")
@@ -72,6 +84,8 @@ def get_prices(ticker: str, limit: int = 30):
 @app.get("/risk")
 def get_risk(tickers: str, weights: str | None = None, value: float = 10_000):
     """Portfolio risk from stored prices. Example: ?tickers=XOM,CVX,NVDA,MSFT&weights=0.25,0.25,0.25,0.25"""
+    start = time.perf_counter()
+
     symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     if len(symbols) < 2:
         raise HTTPException(status_code=400, detail="Give at least two tickers, separated by commas.")
@@ -87,6 +101,13 @@ def get_risk(tickers: str, weights: str | None = None, value: float = 10_000):
             raise HTTPException(status_code=400, detail=f"Weights must add up to 1 (they add up to {w.sum():.4f}).")
     else:
         w = np.full(len(symbols), 1 / len(symbols))
+
+    cache_key = f"risk:{','.join(symbols)}:{','.join(f'{x:.4f}' for x in w)}:{value}"
+    cached = get_json(cache_key)
+    if cached is not None:
+        elapsed = (time.perf_counter() - start) * 1000
+        log.info("Cache HIT %s (%.1f ms)", cache_key, elapsed)
+        return {**cached, "cache": "hit", "elapsed_ms": round(elapsed, 1)}
 
     with get_conn() as conn:
         rows = conn.execute(
@@ -107,11 +128,15 @@ def get_risk(tickers: str, weights: str | None = None, value: float = 10_000):
     if len(returns) < 30:
         raise HTTPException(status_code=400, detail="Need at least 30 overlapping days of prices.")
 
-    result = portfolio_risk(returns, w, value)
-    return {
+    response = {
         "tickers": symbols,
         "weights": [round(float(x), 4) for x in w],
         "portfolio_value": value,
         "days_used": len(returns),
-        **result,
+        **portfolio_risk(returns, w, value),
     }
+    set_json(cache_key, response)
+
+    elapsed = (time.perf_counter() - start) * 1000
+    log.info("Cache MISS %s (%.1f ms)", cache_key, elapsed)
+    return {**response, "cache": "miss", "elapsed_ms": round(elapsed, 1)}

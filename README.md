@@ -7,3 +7,9 @@ A FastAPI service that downloads stock prices and computes portfolio risk.
 docker compose up --build
 
 Then open http://127.0.0.1:8000/docs
+
+## Stop
+
+docker compose down
+
+Stored prices are kept in the `market-data` Docker volume.
