@@ -6,6 +6,7 @@ certifi==2026.10.23
 cffi==2.1.1
 charset-normalizer==3.5.2
 click==8.5.0
+croniter==6.2.4
 curl_cffi==0.17.0
 fastapi==0.162.0
 h11==0.16.0
@@ -27,6 +28,7 @@ python-dateutil==3.0.0
 pytz==2026.5
 redis==8.1.0
 requests==2.34.2
+rq==3.0.0
 six==1.17.0
 soupsieve==3.0.4
 starlette==1.10.0

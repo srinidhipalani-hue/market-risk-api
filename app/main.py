@@ -6,6 +6,11 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
+
+from app.cache import get_json, set_json
+from app.jobs import redis_conn, refresh_job, refresh_queue
 from app.cache import clear_risk_cache, get_json, set_json
 from app.db import get_conn
 from app.risk import daily_returns, portfolio_risk
@@ -19,42 +24,52 @@ def health():
     return {"status" : "ok", "project": "market-risk-api"}
 
 
-@app.post("/tickers/{ticker}/refresh")
+@app.post("/tickers/{ticker}/refresh", status_code=202)
 def refresh_ticker(ticker: str, period: str = "1y"):
+    """Queue a background job to download and store prices for one ticker."""
     symbol = ticker.upper()
-    data = yf.Ticker(symbol).history(period=period)
+    job = refresh_queue.enqueue(
+        refresh_job, symbol, period,
+        job_timeout=120, result_ttl=3600, failure_ttl=3600,
+    )
+    return {"job_id": job.id, "ticker": symbol, "status": "queued"}
 
-    if data.empty:
-        raise HTTPException(status_code=404, detail = f"No data found for {ticker}")
 
-    rows = [(symbol, date.date(), float(close)) for date, close in data["Close"].items()]
+@app.post("/refresh", status_code=202)
+def refresh_many(tickers: str, period: str = "1y"):
+    """Queue one refresh job per ticker. Example: ?tickers=AAPL,AMZN,GOOGL"""
+    symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not symbols:
+        raise HTTPException(status_code=400, detail="Give at least one ticker.")
+    jobs = [
+        refresh_queue.enqueue(
+            refresh_job, s, period,
+            job_timeout=120, result_ttl=3600, failure_ttl=3600,
+        )
+        for s in symbols
+    ]
+    return {"queued": [{"job_id": j.id, "ticker": s} for j, s in zip(jobs, symbols)]}
 
-    with get_conn() as conn:
-        before = conn.execute(
-            "SELECT COUNT(*) FROM prices WHERE ticker = %s", (symbol,)
-        ).fetchone()[0]
 
-        with conn.cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO prices (ticker, date, close)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (ticker, date) DO NOTHING
-                """,
-                rows,
-            )
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    """Check the status of a refresh job, and its result once finished."""
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except NoSuchJobError:
+        raise HTTPException(status_code=404, detail=f"No job with id {job_id}. It may have expired.")
 
-        after = conn.execute(
-            "SELECT COUNT(*) FROM prices WHERE ticker = %s", (symbol,)
-        ).fetchone()[0]
+    status = job.get_status()
+    body = {"job_id": job.id, "status": getattr(status, "value", status)}
 
-    cleared = clear_risk_cache()
-    return {
-        "ticker": symbol,
-        "downloaded": len(rows),
-        "new_rows": after - before,
-        "cache_entries_cleared": cleared,
-    }
+    if body["status"] == "finished":
+        body["result"] = job.return_value()
+        body["seconds"] = round((job.ended_at - job.started_at).total_seconds(), 2)
+    elif body["status"] == "failed":
+        result = job.latest_result()
+        body["error"] = result.exc_string.strip().splitlines()[-1] if result else "Unknown error"
+
+    return body
 
 
 @app.get("/prices/{ticker}")

@@ -30,6 +30,18 @@ services:
       redis:
         condition: service_started
 
+  worker:
+    build: .
+    command: rq worker refresh --url redis://redis:6379/0 --path /app
+    environment:
+      DATABASE_URL: postgresql://market:market@db:5432/market
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
 volumes:
   market-data:
     name: market-data
